@@ -2,7 +2,13 @@
 require('dotenv').config();
 const express = require('express');
 const bcrypt = require('bcrypt');
+const crypto = require('crypto');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const app = express();
+
+// Security headers middleware
+app.use(helmet());
 
 app.use(express.json());
 
@@ -15,10 +21,26 @@ if (!API_KEY || !ADMIN_PASSWORD_HASH) {
   process.exit(1);
 }
 
-// FIX 2: Authentication middleware
+// Rate limiter for admin login endpoint: 5 attempts per 15 minutes
+const adminLoginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // limit each IP to 5 requests per windowMs
+  message: { error: 'Too many login attempts, please try again later' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// FIX 2: Authentication middleware with timing-safe comparison
 function requireApiKey(req, res, next) {
   const provided = req.headers['x-api-key'];
-  if (!provided || provided !== API_KEY) {
+  // Security: use timing-safe comparison to prevent timing attacks
+  if (!provided || typeof provided !== 'string') {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  // Ensure both buffers are the same length for timingSafeEqual
+  const providedBuf = Buffer.from(provided);
+  const expectedBuf = Buffer.from(API_KEY);
+  if (providedBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(providedBuf, expectedBuf)) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
   next();
@@ -34,8 +56,12 @@ app.get('/users', requireApiKey, (req, res) => {
 });
 
 // FIX 3: Parameterized query prevents SQL injection
+// FIX: Validate user ID parameter is a valid integer
 app.get('/user/:id', requireApiKey, (req, res) => {
-  const userId = req.params.id;
+  const userId = parseInt(req.params.id, 10);
+  if (isNaN(userId)) {
+    return res.status(400).json({ error: 'Invalid user ID' });
+  }
   db.query("SELECT id, name, email FROM users WHERE id = ?", [userId], (err, user) => {
     if (err) return res.status(500).json({ error: 'Database error' });
     if (!user) return res.status(404).json({ error: 'User not found' });
@@ -44,7 +70,8 @@ app.get('/user/:id', requireApiKey, (req, res) => {
 });
 
 // FIX 4: Compare against a bcrypt hash, never a hardcoded plaintext password
-app.post('/admin', async (req, res) => {
+// FIX: Added rate limiting and API key requirement to prevent brute-force attacks
+app.post('/admin', adminLoginLimiter, requireApiKey, async (req, res) => {
   const { password } = req.body;
   if (!password) return res.status(400).json({ error: 'Password required' });
 
